@@ -12,11 +12,13 @@ import torchvision.models as models
 import rasterio
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
-import optuna
+import optuna, time
 import sys
 import joblib
 import argparse
 import random
+from sklearn.model_selection import StratifiedGroupKFold
+import copy
 
 # --- Dataset ---
 class SatelliteWealthDataset(Dataset):
@@ -71,7 +73,7 @@ def match_images_to_labels(csv_path, image_folder, target_column):
     return pd.DataFrame(matches)
 
 # --- Training function ---
-def train_model(model, train_loader, test_loader, device, optimizer, criterion, scheduler, scaler, num_epochs, use_cuda=False, patience=10):
+def train_model(model, train_loader, test_loader, device, optimizer, criterion, scheduler, scaler, num_epochs, use_cuda=False, patience=10, trial=None, deadline_ts=None):
     train_losses, val_r2s = [], []
     best_r2 = -float("inf")
     best_state = None
@@ -82,6 +84,9 @@ def train_model(model, train_loader, test_loader, device, optimizer, criterion, 
         running_loss = 0.0
 
         for imgs, labels in train_loader:
+            if deadline_ts and time.time() > deadline_ts:
+                print("Time limit for the trial exceeded. Pruning trial.")
+                raise optuna.exceptions.TrialPruned("Time limit for the trial exceeded.")
             imgs, labels = imgs.to(device), labels.to(device)
 
             optimizer.zero_grad()
@@ -90,6 +95,8 @@ def train_model(model, train_loader, test_loader, device, optimizer, criterion, 
                 loss = criterion(preds, labels)
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -115,6 +122,11 @@ def train_model(model, train_loader, test_loader, device, optimizer, criterion, 
 
         train_losses.append(epoch_loss)
         val_r2s.append(val_r2)
+
+        # also guard validation
+        if deadline_ts and time.time() > deadline_ts:
+            print("Time limit for the trial exceeded. Pruning trial.")
+            raise optuna.exceptions.TrialPruned("Time limit (30 min) exceeded.")
 
         # ---- Early stopping on best Val R² ----
         if val_r2 > best_r2 + 1e-4:
@@ -174,9 +186,25 @@ def objective(trial, index_name, model_name):
     ])
     test_transform = T.Compose([T.Resize((224, 224))])
 
-    # Prepare dataset
+    # --- Prepare dataset with stratified + geo-aware split ---
     dataset_df = match_images_to_labels(CSV_FILE, IMAGE_FOLDER, TARGET_COLUMN)
-    train_df, test_df = train_test_split(dataset_df, test_size=0.2, random_state=42)
+    # Stratify by wealth quantiles to balance label distribution
+    y = dataset_df[TARGET_COLUMN]
+    bins = pd.qcut(y, q=5, labels=False, duplicates='drop')
+    # Group by rounded lat/lon to prevent geographic leakage (e.g., nearby tiles in both sets)
+    geo_group = (
+        dataset_df['image_path']
+        .apply(lambda p: os.path.basename(p).split('_'))
+        .apply(lambda parts: (round(float(parts[1]), 2), round(float(parts[2]), 2)))
+    )
+
+    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+    train_idx, test_idx = next(sgkf.split(dataset_df, bins, groups=geo_group))
+
+    train_df = dataset_df.iloc[train_idx]
+    test_df = dataset_df.iloc[test_idx]
+
+    # Build PyTorch datasets
     train_dataset = SatelliteWealthDataset(train_df, transform=train_transform)
     test_dataset = SatelliteWealthDataset(test_df, transform=test_transform)
 
@@ -235,8 +263,24 @@ def objective(trial, index_name, model_name):
     print(f"Index: {index_name}")
     print(f"Batch Size: {batch_size} - LR: {lr} - Weight Decay: {weight_decay} - Dropout Rate: {dropout_rate}")
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=use_cuda)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=use_cuda)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=use_cuda, 
+        prefetch_factor = 2,
+        timeout=300 # 5 minutes
+        )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=4, 
+        pin_memory=use_cuda, 
+        prefetch_factor = 2,
+        timeout=300 # 5 minutes
+        )
     
     model = model.to(device)
 
@@ -253,20 +297,37 @@ def objective(trial, index_name, model_name):
         )
     scaler = torch.amp.GradScaler(enabled=use_cuda)
 
+    budget_sec = int(os.environ.get("TRIAL_TIME_BUDGET_SEC", 300))  # 5 min default
+    deadline = time.time() + budget_sec
+
     # Train model
-    train_losses, test_r2s, best_r2 = train_model(model, train_loader, test_loader, device, optimizer, criterion, scheduler, scaler, num_epochs=num_epochs, use_cuda=use_cuda, patience=10)
+    train_losses, val_r2s, best_r2 = train_model(
+        model, 
+        train_loader, 
+        test_loader, 
+        device, 
+        optimizer, 
+        criterion, 
+        scheduler, 
+        scaler, 
+        num_epochs=num_epochs, 
+        use_cuda=use_cuda,
+        patience=10,
+        trial=trial, 
+        deadline_ts=deadline
+        )
 
     TRIAL_ID = int(os.environ.get("SLURM_ARRAY_TASK_ID", trial.number))  # Fallback if running locally
 
-    model_output_dir = f"../optuna/models/{model_name}/{index_name}"
+    model_output_dir = f"../optuna/models/single/{model_name}/{index_name}"
     os.makedirs(model_output_dir, exist_ok=True)
     # Save best model for this trial
     torch.save(model.state_dict(), f"{model_output_dir}/trial_{TRIAL_ID}.pth")
 
-    r2_scores_output_dir = f"../optuna/r2_scores/{model_name}/{index_name}"
+    r2_scores_output_dir = f"../optuna/r2_scores/single/{model_name}/{index_name}"
     os.makedirs(r2_scores_output_dir, exist_ok=True)
     # Save R² scores per epoch for this trial
-    np.save(f"{r2_scores_output_dir}/trial_{TRIAL_ID}.npy", np.array(test_r2s))
+    np.save(f"{r2_scores_output_dir}/trial_{TRIAL_ID}.npy", np.array(val_r2s))
 
     return best_r2
 

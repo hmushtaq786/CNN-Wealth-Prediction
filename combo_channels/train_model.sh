@@ -3,7 +3,7 @@
 #SBATCH -t 20:00:00                                          # estimated time # TODO: adapt to your needs/ the full training run will take approx. 5 h on an A100
 #SBATCH -p grete:shared                                     # the partition you are training on (i.e., which nodes), for nodes see sinfo -o "%25N  %5c  %10m  %32f  %10G %18P " | grep gpu
 #SBATCH --gres=gpu:A100:1                                   # requesting GPU slices, see https://docs.hpc.gwdg.de/usage_guide/slurm/gpu_usage/index.html for more options
-#SBATCH -a 0-9%5                                            # 10 trials = 10 jobs, Max 5 trials at once
+#SBATCH -a 0-4                                            # 5 trials = 5 jobs, Max 5 trials at once
 #SBATCH -n 1
 #SBATCH -c 8    # Each trial gets 8 CPU cores
 #SBATCH --output=../../slurm_logs/single/model_training/resnet/ndvi/training-score_trial_%A_%a.out      # where to write output, %x give job name, %j names job id
